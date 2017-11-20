@@ -34,7 +34,6 @@ import org.apache.hadoop.hbase.client.backoff.ServerStatistics;
 import org.apache.hadoop.hbase.client.coprocessor.Batch;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
-import org.apache.hadoop.hbase.regionserver.MemStoreSize;
 import org.apache.hadoop.hbase.regionserver.Region;
 import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -105,7 +104,7 @@ public class TestClientPushback {
     mutator.flush();
 
     // get the current load on RS. Hopefully memstore isn't flushed since we wrote the the data
-    int load = (int) ((((HRegion) region).addAndGetMemStoreSize(new MemStoreSize(0, 0)) * 100)
+    int load = (int) ((((HRegion) region).getMemStoreDataSize() * 100)
         / flushSizeBytes);
     LOG.debug("Done writing some data to "+tableName);
 

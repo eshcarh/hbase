@@ -1013,7 +1013,7 @@ public final class CellUtil {
    */
   @Deprecated
   public static long estimatedHeapSizeOf(final Cell cell) {
-    return PrivateCellUtil.estimatedHeapSizeOf(cell);
+    return PrivateCellUtil.estimatedSizeOfCell(cell);
   }
 
   /********************* tags *************************************/

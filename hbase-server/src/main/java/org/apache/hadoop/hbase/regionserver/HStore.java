@@ -399,7 +399,7 @@ public class HStore implements Store, HeapSize, StoreConfigInformation, Propagat
   @Override
   public long getMemStoreFlushSize() {
     // TODO: Why is this in here?  The flushsize of the region rather than the store?  St.Ack
-    return this.region.memstoreFlushSize;
+    return this.region.memStoreFlushHeapSize;
   }
 
   @Override
@@ -2191,7 +2191,7 @@ public class HStore implements Store, HeapSize, StoreConfigInformation, Propagat
       this.cacheFlushCount = snapshot.getCellsCount();
       this.cacheFlushSize = snapshot.getDataSize();
       committedFiles = new ArrayList<>(1);
-      return new MemStoreSize(snapshot.getDataSize(), snapshot.getHeapSize());
+      return new MemStoreSize(snapshot.getMemStoreSize());
     }
 
     @Override

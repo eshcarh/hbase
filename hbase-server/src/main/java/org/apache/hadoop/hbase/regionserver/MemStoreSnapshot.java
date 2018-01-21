@@ -29,8 +29,7 @@ import java.util.List;
 public class MemStoreSnapshot {
   private final long id;
   private final int cellsCount;
-  private final long dataSize;
-  private final long heapSize;
+  private final MemStoreSize memStoreSize;
   private final TimeRangeTracker timeRangeTracker;
   private final List<KeyValueScanner> scanners;
   private final boolean tagsPresent;
@@ -38,8 +37,7 @@ public class MemStoreSnapshot {
   public MemStoreSnapshot(long id, ImmutableSegment snapshot) {
     this.id = id;
     this.cellsCount = snapshot.getCellsCount();
-    this.dataSize = snapshot.keySize();
-    this.heapSize = snapshot.heapSize();
+    this.memStoreSize = snapshot.getMemStoreSize();
     this.timeRangeTracker = snapshot.getTimeRangeTracker();
     this.scanners = snapshot.getScanners(Long.MAX_VALUE, Long.MAX_VALUE);
     this.tagsPresent = snapshot.isTagsPresent();
@@ -59,15 +57,12 @@ public class MemStoreSnapshot {
     return cellsCount;
   }
 
-  /**
-   * @return Total memory size occupied by this snapshot.
-   */
   public long getDataSize() {
-    return dataSize;
+    return memStoreSize.getDataSize();
   }
 
-  public long getHeapSize() {
-    return heapSize;
+  public MemStoreSize getMemStoreSize() {
+    return memStoreSize;
   }
 
   /**
@@ -90,4 +85,5 @@ public class MemStoreSnapshot {
   public boolean isTagsPresent() {
     return this.tagsPresent;
   }
+
 }

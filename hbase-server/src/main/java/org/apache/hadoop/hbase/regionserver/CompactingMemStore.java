@@ -55,6 +55,11 @@ import org.apache.hadoop.hbase.wal.WAL;
 public class CompactingMemStore extends AbstractMemStore {
 
   // The external setting of the compacting MemStore behaviour
+  public static final String COMPACTING_MEMSTORE_INDEX_KEY =
+      "hbase.hregion.compacting.memstore.index";
+  // usage of CellArrayMap is default, later it will be decided how to use CellChunkMap
+  public static final String COMPACTING_MEMSTORE_INDEX_DEFAULT =
+      String.valueOf(IndexType.NOT_DEFINED);
   public static final String COMPACTING_MEMSTORE_TYPE_KEY =
       "hbase.hregion.compacting.memstore.type";
   public static final String COMPACTING_MEMSTORE_TYPE_DEFAULT =
@@ -87,7 +92,8 @@ public class CompactingMemStore extends AbstractMemStore {
   public enum IndexType {
     CSLM_MAP,   // ConcurrentSkipLisMap
     ARRAY_MAP,  // CellArrayMap
-    CHUNK_MAP   // CellChunkMap
+    CHUNK_MAP,  // CellChunkMap
+    NOT_DEFINED
   }
 
   private IndexType indexType = IndexType.ARRAY_MAP;  // default implementation
@@ -116,13 +122,20 @@ public class CompactingMemStore extends AbstractMemStore {
     } else {
       indexType = IndexType.ARRAY_MAP;
     }
+    IndexType confIndexType = IndexType.valueOf(conf.get(
+        COMPACTING_MEMSTORE_INDEX_KEY,
+        COMPACTING_MEMSTORE_INDEX_DEFAULT));
+    if (IndexType.NOT_DEFINED != confIndexType){
+      // if user has defined the index type manually it overwrites the defaults
+      indexType = confIndexType;
+    }
     // initialization of the flush size should happen after initialization of the index type
     // so do not transfer the following method
     initInmemoryFlushSize(conf);
-    LOG.info("Store={}, in-memory flush size threshold={}, immutable segments index type={}, " +
-            "compactor={}", this.store.getColumnFamilyName(),
+    LOG.info("Store={}, in-memory flush size threshold={}, immutable segments index type={}, "
+            + "compactor={}", this.store.getColumnFamilyName(),
         StringUtils.byteDesc(this.inmemoryFlushSize), this.indexType,
-        (this.compactor == null? "NULL": this.compactor.toString()));
+        (this.compactor == null ? "NULL" : this.compactor.toString()));
   }
 
   @VisibleForTesting

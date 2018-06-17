@@ -1714,16 +1714,12 @@ public class TestHStore {
     }
 
     @Override
-    protected boolean shouldFlushInMemory(MutableSegment currActive, Cell cellToAdd,
-        MemStoreSizing memstoreSizing) {
-      boolean rval = super.shouldFlushInMemory(currActive, cellToAdd, memstoreSizing);
-      if (rval) {
-        RUNNER_COUNT.incrementAndGet();
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("runner count: " + RUNNER_COUNT.get());
-        }
+    void inMemoryCompaction() {
+      RUNNER_COUNT.incrementAndGet();
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("runner count: " + RUNNER_COUNT.get());
       }
-      return rval;
+      super.inMemoryCompaction();
     }
   }
 

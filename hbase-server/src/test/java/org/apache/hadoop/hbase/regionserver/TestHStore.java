@@ -1714,8 +1714,9 @@ public class TestHStore {
     }
 
     @Override
-    protected boolean shouldFlushInMemory() {
-      boolean rval = super.shouldFlushInMemory();
+    protected boolean shouldFlushInMemory(MutableSegment currActive, Cell cellToAdd,
+        MemStoreSizing memstoreSizing) {
+      boolean rval = super.shouldFlushInMemory(currActive, cellToAdd, memstoreSizing);
       if (rval) {
         RUNNER_COUNT.incrementAndGet();
         if (LOG.isDebugEnabled()) {

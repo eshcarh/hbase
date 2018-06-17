@@ -60,6 +60,7 @@ public class CellArrayImmutableSegment extends ImmutableSegment {
     super(segment); // initiailize the upper class
     long indexOverhead = DEEP_OVERHEAD_CAM - CSLMImmutableSegment.DEEP_OVERHEAD_CSLM;
     incMemStoreSize(0, indexOverhead, 0); // CAM is always on-heap
+    memstoreSizing.incMemStoreSize(0, indexOverhead, 0);
     int numOfCells = segment.getCellsCount();
     // build the new CellSet based on CellChunkMap and update the CellSet of this Segment
     reinitializeCellSet(numOfCells, segment.getScanner(Long.MAX_VALUE), segment.getCellSet(),

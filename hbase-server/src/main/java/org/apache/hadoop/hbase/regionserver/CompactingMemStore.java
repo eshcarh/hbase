@@ -67,7 +67,7 @@ public class CompactingMemStore extends AbstractMemStore {
   // Default fraction of in-memory-flush size w.r.t. flush-to-disk size
   public static final String IN_MEMORY_FLUSH_THRESHOLD_FACTOR_KEY =
       "hbase.memstore.inmemoryflush.threshold.factor";
-  private static final double IN_MEMORY_FLUSH_THRESHOLD_FACTOR_DEFAULT = 0.014;
+//  private static final double IN_MEMORY_FLUSH_THRESHOLD_FACTOR_DEFAULT = 0.014;
 
   private static final Logger LOG = LoggerFactory.getLogger(CompactingMemStore.class);
   private HStore store;
@@ -76,7 +76,7 @@ public class CompactingMemStore extends AbstractMemStore {
   protected MemStoreCompactor compactor;
 
   private long inmemoryFlushSize;       // the threshold on active size for in-memory flush
-  private final AtomicBoolean inMemoryFlushInProgress = new AtomicBoolean(false);
+  private final AtomicBoolean inMemoryCompactionInProgress = new AtomicBoolean(false);
 
   // inWalReplay is true while we are synchronously replaying the edits from WAL
   private boolean inWalReplay = false;
@@ -100,11 +100,11 @@ public class CompactingMemStore extends AbstractMemStore {
 
   public static final long DEEP_OVERHEAD = ClassSize.align( AbstractMemStore.DEEP_OVERHEAD
       + 7 * ClassSize.REFERENCE     // Store, RegionServicesForStores, CompactionPipeline,
-                                    // MemStoreCompactor, inMemoryFlushInProgress, allowCompaction,
+                                    // MemStoreCompactor, inMemoryCompactionInProgress, allowCompaction,
                                     // indexType
       + Bytes.SIZEOF_LONG           // inmemoryFlushSize
       + 2 * Bytes.SIZEOF_BOOLEAN    // compositeSnapshot and inWalReplay
-      + 2 * ClassSize.ATOMIC_BOOLEAN// inMemoryFlushInProgress and allowCompaction
+      + 2 * ClassSize.ATOMIC_BOOLEAN// inMemoryCompactionInProgress and allowCompaction
       + CompactionPipeline.DEEP_OVERHEAD + MemStoreCompactor.DEEP_OVERHEAD);
 
   public CompactingMemStore(Configuration conf, CellComparator c,
@@ -152,12 +152,13 @@ public class CompactingMemStore extends AbstractMemStore {
       // Family number might also be zero in some of our unit test case
       numStores = 1;
     }
-    inmemoryFlushSize = memstoreFlushSize / numStores;
-    // multiply by a factor (the same factor for all index types)
-    factor = conf.getDouble(IN_MEMORY_FLUSH_THRESHOLD_FACTOR_KEY,
-          IN_MEMORY_FLUSH_THRESHOLD_FACTOR_DEFAULT);
-
-    inmemoryFlushSize = (long) (inmemoryFlushSize * factor);
+    factor = conf.getDouble(IN_MEMORY_FLUSH_THRESHOLD_FACTOR_KEY, 0.0);
+    if(factor != 0.0) {
+      // multiply by a factor (the same factor for all index types)
+      inmemoryFlushSize = (long) (factor * memstoreFlushSize) / numStores;
+    } else {
+      inmemoryFlushSize = conf.getLong(MemStoreLAB.CHUNK_SIZE_KEY, MemStoreLAB.CHUNK_SIZE_DEFAULT);
+    }
   }
 
   /**
@@ -169,7 +170,7 @@ public class CompactingMemStore extends AbstractMemStore {
   @Override
   public MemStoreSize size() {
     MemStoreSizing memstoreSizing = new NonThreadSafeMemStoreSizing();
-    memstoreSizing.incMemStoreSize(active.getMemStoreSize());
+    memstoreSizing.incMemStoreSize(getActive().getMemStoreSize());
     for (Segment item : pipeline.getSegments()) {
       memstoreSizing.incMemStoreSize(item.getMemStoreSize());
     }
@@ -216,7 +217,9 @@ public class CompactingMemStore extends AbstractMemStore {
       LOG.debug("FLUSHING TO DISK {}, store={}",
             getRegionServices().getRegionInfo().getEncodedName(), getFamilyName());
       stopCompaction();
-      pushActiveToPipeline(this.active);
+      // region level lock ensures pushing active to pipeline is done in isolation
+      // no concurrent update operations trying to flush the active segment
+      pushActiveToPipeline(getActive());
       snapshotId = EnvironmentEdgeManager.currentTime();
       // in both cases whatever is pushed to snapshot is cleared from the pipeline
       if (compositeSnapshot) {
@@ -236,19 +239,22 @@ public class CompactingMemStore extends AbstractMemStore {
       // if snapshot is empty the tail of the pipeline (or everything in the memstore) is flushed
       if (compositeSnapshot) {
         MemStoreSizing memStoreSizing = new NonThreadSafeMemStoreSizing(pipeline.getPipelineSize());
-        memStoreSizing.incMemStoreSize(this.active.getMemStoreSize());
+        MutableSegment currActive = getActive();
+        if(!currActive.isEmpty()) {
+          memStoreSizing.incMemStoreSize(currActive.getMemStoreSize());
+        }
         mss = memStoreSizing.getMemStoreSize();
       } else {
         mss = pipeline.getTailSize();
       }
     }
-    return mss.getDataSize() > 0? mss: this.active.getMemStoreSize();
+    return mss.getDataSize() > 0? mss: getActive().getMemStoreSize();
   }
 
   @Override
   protected long keySize() {
     // Need to consider dataSize/keySize of all segments in pipeline and active
-    long keySize = this.active.getDataSize();
+    long keySize = getActive().getDataSize();
     for (Segment segment : this.pipeline.getSegments()) {
       keySize += segment.getDataSize();
     }
@@ -258,7 +264,7 @@ public class CompactingMemStore extends AbstractMemStore {
   @Override
   protected long heapSize() {
     // Need to consider heapOverhead of all segments in pipeline and active
-    long h = this.active.getHeapSize();
+    long h = getActive().getHeapSize();
     for (Segment segment : this.pipeline.getSegments()) {
       h += segment.getHeapSize();
     }
@@ -296,15 +302,34 @@ public class CompactingMemStore extends AbstractMemStore {
     inWalReplay = false;
   }
 
+  @Override protected boolean preUpdate(MutableSegment currentActive, Cell cell,
+      MemStoreSizing memstoreSizing) {
+    if(currentActive.sharedLock()) {
+      if (checkAndAddToActiveSize(currentActive, cell, memstoreSizing)) {
+        return true;
+      }
+      currentActive.sharedUnlock();
+    }
+    return false;
+  }
+
+  @Override protected void postUpdate(MutableSegment currentActive) {
+    currentActive.sharedUnlock();
+  }
+
+  @Override protected boolean sizeAddedPreOperation() {
+    return true;
+  }
+
   // the getSegments() method is used for tests only
   @VisibleForTesting
   @Override
   protected List<Segment> getSegments() {
     List<? extends Segment> pipelineList = pipeline.getSegments();
     List<Segment> list = new ArrayList<>(pipelineList.size() + 2);
-    list.add(this.active);
+    list.add(getActive());
     list.addAll(pipelineList);
-    list.addAll(this.snapshot.getAllSegments());
+    list.addAll(snapshot.getAllSegments());
 
     return list;
   }
@@ -364,7 +389,7 @@ public class CompactingMemStore extends AbstractMemStore {
 
   @Override
   public List<KeyValueScanner> getScanners(long readPt) throws IOException {
-    MutableSegment activeTmp = active;
+    MutableSegment activeTmp = getActive();
     List<? extends Segment> pipelineList = pipeline.getSegments();
     List<? extends Segment> snapshotList = snapshot.getAllSegments();
     long numberOfSegments = 1L + pipelineList.size() + snapshotList.size();
@@ -386,46 +411,61 @@ public class CompactingMemStore extends AbstractMemStore {
    * The method is invoked upon every addition to the active set.
    * For CompactingMemStore, flush the active set to the read-only memory if it's
    * size is above threshold
+   * @param currActive intended segment to update
+   * @param cellToAdd cell to be added to the segment
+   * @param memstoreSizing
+   * @return true if the cell can be added to the
    */
   @Override
-  protected void checkActiveSize() {
-    if (shouldFlushInMemory()) {
-      /* The thread is dispatched to flush-in-memory. This cannot be done
-      * on the same thread, because for flush-in-memory we require updatesLock
-      * in exclusive mode while this method (checkActiveSize) is invoked holding updatesLock
-      * in the shared mode. */
-      InMemoryFlushRunnable runnable = new InMemoryFlushRunnable();
-      if (LOG.isTraceEnabled()) {
-        LOG.trace(
-          "Dispatching the MemStore in-memory flush for store " + store.getColumnFamilyName());
+  protected boolean checkAndAddToActiveSize(MutableSegment currActive, Cell cellToAdd,
+      MemStoreSizing memstoreSizing) {
+    if (shouldFlushInMemory(currActive, cellToAdd, memstoreSizing)) {
+      if(currActive.setInMemoryFlushed()) {
+        flushInMemory(currActive);
+        if (inMemoryCompactionInProgress.compareAndSet(false, true)) {
+          // The thread is dispatched to do in-memory compaction. This cannot be done
+          // on the same thread, because for in-memory-compaction we require updatesLock in
+          // exclusive mode while this method (checkActiveSize) is invoked holding updatesLock in
+          // the shared mode.
+          InMemoryCompactionRunnable runnable = new InMemoryCompactionRunnable();
+          if (LOG.isTraceEnabled()) {
+            LOG.trace("Dispatching the MemStore in-memory flush for store " + store
+                .getColumnFamilyName());
+          }
+          getPool().execute(runnable);
+        }
       }
-      getPool().execute(runnable);
+      return false;
     }
+    return true;
   }
 
-  // internally used method, externally visible only for tests
+  // externally visible only for tests
   // when invoked directly from tests it must be verified that the caller doesn't hold updatesLock,
   // otherwise there is a deadlock
   @VisibleForTesting
-  void flushInMemory() throws IOException {
-    // setting the inMemoryFlushInProgress flag again for the case this method is invoked
-    // directly (only in tests) in the common path setting from true to true is idempotent
-    inMemoryFlushInProgress.set(true);
-    try {
-      // Phase I: Update the pipeline
-      getRegionServices().blockUpdates();
-      try {
-        LOG.trace("IN-MEMORY FLUSH: Pushing active segment into compaction pipeline");
-        pushActiveToPipeline(this.active);
-      } finally {
-        getRegionServices().unblockUpdates();
-      }
+  void flushInMemory() {
+    MutableSegment currActive = getActive();
+    if(currActive.setInMemoryFlushed()) {
+      flushInMemory(currActive);
+    }
+    inMemoryCompaction();
+  }
 
+  private void flushInMemory(MutableSegment currActive) {
+    LOG.trace("IN-MEMORY FLUSH: Pushing active segment into compaction pipeline");
+    pushActiveToPipeline(currActive);
+  }
+
+  void inMemoryCompaction() {
+    // setting the inMemoryCompactionInProgress flag again for the case this method is invoked
+    // directly (only in tests) in the common path setting from true to true is idempotent
+    inMemoryCompactionInProgress.set(true);
+    try {
       // Used by tests
       if (!allowCompaction.get()) {
         return;
       }
-      // Phase II: Compact the pipeline
       try {
         // Speculative compaction execution, may be interrupted if flush is forced while
         // compaction is in progress
@@ -435,8 +475,7 @@ public class CompactingMemStore extends AbstractMemStore {
             getRegionServices().getRegionInfo().getEncodedName(), getFamilyName(), e);
       }
     } finally {
-      inMemoryFlushInProgress.set(false);
-      LOG.trace("IN-MEMORY FLUSH: end");
+      inMemoryCompactionInProgress.set(false);
     }
   }
 
@@ -455,16 +494,26 @@ public class CompactingMemStore extends AbstractMemStore {
   }
 
   @VisibleForTesting
-  protected boolean shouldFlushInMemory() {
-    if (this.active.getDataSize() > inmemoryFlushSize) { // size above flush threshold
-      if (inWalReplay) {  // when replaying edits from WAL there is no need in in-memory flush
-        return false;     // regardless the size
-      }
-      // the inMemoryFlushInProgress is CASed to be true here in order to mutual exclude
-      // the insert of the active into the compaction pipeline
-      return (inMemoryFlushInProgress.compareAndSet(false,true));
+  protected boolean shouldFlushInMemory(MutableSegment currActive, Cell cellToAdd,
+      MemStoreSizing memstoreSizing) {
+    if (inWalReplay) {  // when replaying edits from WAL there is no need in in-memory flush
+      return false;     // regardless the size
     }
-    return false;
+    long cellSize = currActive.getCellLength(cellToAdd);
+    long segmentDataSize = currActive.getDataSize();
+    while ( segmentDataSize + cellSize < inmemoryFlushSize) {
+      // size below flush threshold try to update atomically
+      if(currActive.compareAndSetDataSize(segmentDataSize, segmentDataSize + cellSize)) {
+        if(memstoreSizing != null){
+          memstoreSizing.incMemStoreSize(cellSize, 0, 0);
+        }
+        //enough space for cell - no need to flush
+        return false;
+      }
+      segmentDataSize = currActive.getDataSize();
+    }
+    // size above flush threshold
+    return true;
   }
 
   /**
@@ -473,14 +522,14 @@ public class CompactingMemStore extends AbstractMemStore {
    * Non-blocking request
    */
   private void stopCompaction() {
-    if (inMemoryFlushInProgress.get()) {
+    if (inMemoryCompactionInProgress.get()) {
       compactor.stop();
     }
   }
 
-  protected void pushActiveToPipeline(MutableSegment active) {
-    if (!active.isEmpty()) {
-      pipeline.pushHead(active);
+  protected void pushActiveToPipeline(MutableSegment currActive) {
+    if (!currActive.isEmpty()) {
+      pipeline.pushHead(currActive);
       resetActive();
     }
   }
@@ -536,23 +585,16 @@ public class CompactingMemStore extends AbstractMemStore {
   * It takes the updatesLock exclusively, pushes active into the pipeline, releases updatesLock
   * and compacts the pipeline.
   */
-  private class InMemoryFlushRunnable implements Runnable {
-
+  private class InMemoryCompactionRunnable implements Runnable {
     @Override
     public void run() {
-      try {
-        flushInMemory();
-      } catch (IOException e) {
-        LOG.warn("Unable to run memstore compaction. region "
-            + getRegionServices().getRegionInfo().getRegionNameAsString()
-            + "store: "+ getFamilyName(), e);
-      }
+      inMemoryCompaction();
     }
   }
 
   @VisibleForTesting
   boolean isMemStoreFlushingInMemory() {
-    return inMemoryFlushInProgress.get();
+    return inMemoryCompactionInProgress.get();
   }
 
   /**
@@ -580,10 +622,10 @@ public class CompactingMemStore extends AbstractMemStore {
 
   // debug method
   public void debug() {
-    String msg = "active size=" + this.active.getDataSize();
+    String msg = "active size=" + getActive().getDataSize();
     msg += " in-memory flush size is "+ inmemoryFlushSize;
     msg += " allow compaction is "+ (allowCompaction.get() ? "true" : "false");
-    msg += " inMemoryFlushInProgress is "+ (inMemoryFlushInProgress.get() ? "true" : "false");
+    msg += " inMemoryCompactionInProgress is "+ (inMemoryCompactionInProgress.get() ? "true" : "false");
     LOG.debug(msg);
   }
 

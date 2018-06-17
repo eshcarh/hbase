@@ -47,7 +47,7 @@ public abstract class AbstractMemStore implements MemStore {
   private final CellComparator comparator;
 
   // active segment absorbs write operations
-  protected volatile MutableSegment active;
+  private volatile MutableSegment active;
   // Snapshot of memstore.  Made for flusher.
   protected volatile ImmutableSegment snapshot;
   protected volatile long snapshotId;
@@ -82,8 +82,8 @@ public abstract class AbstractMemStore implements MemStore {
 
   protected void resetActive() {
     // Reset heap to not include any keys
-    this.active = SegmentFactory.instance().createMutableSegment(conf, comparator);
-    this.timeOfOldestEdit = Long.MAX_VALUE;
+    active = SegmentFactory.instance().createMutableSegment(conf, comparator);
+    timeOfOldestEdit = Long.MAX_VALUE;
   }
 
   /**
@@ -102,22 +102,36 @@ public abstract class AbstractMemStore implements MemStore {
 
   @Override
   public void add(Cell cell, MemStoreSizing memstoreSizing) {
-    Cell toAdd = maybeCloneWithAllocator(cell, false);
-    boolean mslabUsed = (toAdd != cell);
-    // This cell data is backed by the same byte[] where we read request in RPC(See HBASE-15180). By
-    // default MSLAB is ON and we might have copied cell to MSLAB area. If not we must do below deep
-    // copy. Or else we will keep referring to the bigger chunk of memory and prevent it from
-    // getting GCed.
-    // Copy to MSLAB would not have happened if
-    // 1. MSLAB is turned OFF. See "hbase.hregion.memstore.mslab.enabled"
-    // 2. When the size of the cell is bigger than the max size supported by MSLAB. See
-    // "hbase.hregion.memstore.mslab.max.allocation". This defaults to 256 KB
-    // 3. When cells are from Append/Increment operation.
-    if (!mslabUsed) {
-      toAdd = deepCopyIfNeeded(toAdd);
+    MutableSegment currentActive;
+    boolean succ = false;
+    while(!succ) {
+      currentActive = getActive();
+      succ = preUpdate(currentActive, cell, memstoreSizing);
+      if(succ) {
+        Cell toAdd = maybeCloneWithAllocator(currentActive, cell, false);
+        boolean mslabUsed = (toAdd != cell);
+        // This cell data is backed by the same byte[] where we read request in RPC(See HBASE-15180). By
+        // default MSLAB is ON and we might have copied cell to MSLAB area. If not we must do below deep
+        // copy. Or else we will keep referring to the bigger chunk of memory and prevent it from
+        // getting GCed.
+        // Copy to MSLAB would not have happened if
+        // 1. MSLAB is turned OFF. See "hbase.hregion.memstore.mslab.enabled"
+        // 2. When the size of the cell is bigger than the max size supported by MSLAB. See
+        // "hbase.hregion.memstore.mslab.max.allocation". This defaults to 256 KB
+        // 3. When cells are from Append/Increment operation.
+        if (!mslabUsed) {
+          toAdd = deepCopyIfNeeded(toAdd);
+        }
+        internalAdd(currentActive, toAdd, mslabUsed, memstoreSizing);
+        postUpdate(currentActive);
+      }
     }
-    internalAdd(toAdd, mslabUsed, memstoreSizing);
   }
+
+  protected abstract boolean preUpdate(MutableSegment currentActive, Cell cell,
+      MemStoreSizing memstoreSizing);
+
+  protected abstract void postUpdate(MutableSegment currentActive);
 
   private static Cell deepCopyIfNeeded(Cell cell) {
     if (cell instanceof ExtendedCell) {
@@ -188,7 +202,7 @@ public abstract class AbstractMemStore implements MemStore {
   }
 
   protected void dump(Logger log) {
-    active.dump(log);
+    getActive().dump(log);
     snapshot.dump(log);
   }
 
@@ -209,19 +223,29 @@ public abstract class AbstractMemStore implements MemStore {
    * @param memstoreSize
    */
   private void upsert(Cell cell, long readpoint, MemStoreSizing memstoreSizing) {
-    // Add the Cell to the MemStore
-    // Use the internalAdd method here since we (a) already have a lock
-    // and (b) cannot safely use the MSLAB here without potentially
-    // hitting OOME - see TestMemStore.testUpsertMSLAB for a
-    // test that triggers the pathological case if we don't avoid MSLAB
-    // here.
-    // This cell data is backed by the same byte[] where we read request in RPC(See HBASE-15180). We
-    // must do below deep copy. Or else we will keep referring to the bigger chunk of memory and
-    // prevent it from getting GCed.
-    cell = deepCopyIfNeeded(cell);
-    this.active.upsert(cell, readpoint, memstoreSizing);
-    setOldestEditTimeToNow();
-    checkActiveSize();
+    MutableSegment currentActive;
+    boolean succ = false;
+    while (!succ) {
+      currentActive = getActive();
+      succ = preUpdate(currentActive, cell, memstoreSizing);
+      if (succ) {
+        // Add the Cell to the MemStore
+        // Use the internalAdd method here since we (a) already have a lock
+        // and (b) cannot safely use the MSLAB here without potentially
+        // hitting OOME - see TestMemStore.testUpsertMSLAB for a
+        // test that triggers the pathological case if we don't avoid MSLAB
+        // here.
+        // This cell data is backed by the same byte[] where we read request in RPC(See HBASE-15180). We
+        // must do below deep copy. Or else we will keep referring to the bigger chunk of memory and
+        // prevent it from getting GCed.
+        cell = deepCopyIfNeeded(cell);
+        boolean sizeAddedPreOperation = sizeAddedPreOperation();
+        currentActive.upsert(cell, readpoint, memstoreSizing, sizeAddedPreOperation);
+        setOldestEditTimeToNow();
+        return;
+      }
+      postUpdate(currentActive);
+    }
   }
 
   /*
@@ -275,8 +299,9 @@ public abstract class AbstractMemStore implements MemStore {
    * @param forceCloneOfBigCell true only during the process of flattening to CellChunkMap.
    * @return either the given cell or its clone
    */
-  private Cell maybeCloneWithAllocator(Cell cell, boolean forceCloneOfBigCell) {
-    return active.maybeCloneWithAllocator(cell, forceCloneOfBigCell);
+  private Cell maybeCloneWithAllocator(MutableSegment currentActive, Cell cell, boolean
+      forceCloneOfBigCell) {
+    return currentActive.maybeCloneWithAllocator(cell, forceCloneOfBigCell);
   }
 
   /*
@@ -288,11 +313,14 @@ public abstract class AbstractMemStore implements MemStore {
    * @param mslabUsed whether using MSLAB
    * @param memstoreSize
    */
-  private void internalAdd(final Cell toAdd, final boolean mslabUsed, MemStoreSizing memstoreSizing) {
-    active.add(toAdd, mslabUsed, memstoreSizing);
+  private void internalAdd(MutableSegment currentActive, final Cell toAdd, final boolean
+      mslabUsed, MemStoreSizing memstoreSizing) {
+    boolean sizeAddedPreOperation = sizeAddedPreOperation();
+    currentActive.add(toAdd, mslabUsed, memstoreSizing, sizeAddedPreOperation);
     setOldestEditTimeToNow();
-    checkActiveSize();
   }
+
+  protected abstract boolean sizeAddedPreOperation();
 
   private void setOldestEditTimeToNow() {
     if (timeOfOldestEdit == Long.MAX_VALUE) {
@@ -327,8 +355,13 @@ public abstract class AbstractMemStore implements MemStore {
 
   /**
    * Check whether anything need to be done based on the current active set size
+   * @param currActive intended segment to update
+   * @param cellToAdd cell to be added to the segment
+   * @param memstoreSizing
+   * @return true if the cell can be added to the
    */
-  protected abstract void checkActiveSize();
+  protected abstract boolean checkAndAddToActiveSize(MutableSegment currActive, Cell cellToAdd,
+      MemStoreSizing memstoreSizing);
 
   /**
    * @return an ordered list of segments from most recent to oldest in memstore

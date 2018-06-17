@@ -798,12 +798,12 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore 
     // One cell is duplicated, but it shouldn't be compacted because we are in BASIC mode.
     // totalCellsLen should remain the same
     long oneCellOnCCMHeapSize =
-            ClassSize.CELL_CHUNK_MAP_ENTRY + ClassSize.align(KeyValueUtil.length(kv));
+            ClassSize.CELL_CHUNK_MAP_ENTRY + Segment.getCellLength(kv);
     totalHeapSize = MutableSegment.DEEP_OVERHEAD + CellChunkImmutableSegment.DEEP_OVERHEAD_CCM
             + numOfCells * oneCellOnCCMHeapSize;
 
-    assertEquals(totalCellsLen, regionServicesForStores.getMemStoreSize());
-    assertEquals(totalHeapSize, ((CompactingMemStore) memstore).heapSize());
+    assertEquals(totalCellsLen+ChunkCreator.SIZEOF_CHUNK_HEADER, regionServicesForStores.getMemStoreSize());
+    assertEquals(totalHeapSize+ChunkCreator.SIZEOF_CHUNK_HEADER, ((CompactingMemStore) memstore).heapSize());
 
     MemStoreSize mss = memstore.getFlushableSize();
     MemStoreSnapshot snapshot = memstore.snapshot(); // push keys to snapshot
@@ -874,7 +874,7 @@ public class TestCompactingToCellFlatMapMemStore extends TestCompactingMemStore 
     KeyValue kv = new KeyValue(Bytes.toBytes("A"), Bytes.toBytes("testfamily"),
             Bytes.toBytes("testqualifier"), System.currentTimeMillis(), val);
     long oneCellOnCCMHeapSize =
-            ClassSize.CELL_CHUNK_MAP_ENTRY + ClassSize.align(KeyValueUtil.length(kv));
+            ClassSize.CELL_CHUNK_MAP_ENTRY + Segment.getCellLength(kv);
 
     long totalHeapSize = MutableSegment.DEEP_OVERHEAD;
     for (int i = 0; i < 5; i++) {
